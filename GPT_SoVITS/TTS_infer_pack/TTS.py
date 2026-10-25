@@ -41,6 +41,7 @@ from tools.i18n.i18n import I18nAuto, scan_language_list
 from TTS_infer_pack.text_segmentation_method import splits
 from TTS_infer_pack.TextPreprocessor import TextPreprocessor
 from sv import SV
+from vtuber_engine_support import InferenceCancelled, check_request_cancelled
 
 resample_transform_dict = {}
 resampy_filter_cache = {}
@@ -1142,7 +1143,21 @@ class TTS:
             Tuple[int, np.ndarray]: sampling rate and audio data.
         """
         ########## variables initialization ###########
+        cancel_event = inputs.get("_cancel_event")
+        strict_errors = inputs.get("_strict_errors", False)
+        if type(strict_errors) is not bool:
+            raise TypeError("_strict_errors must be a bool")
+        # run() is a generator: cancellation may arrive before its first next().
+        # Never clear the per-request event when resetting the legacy stop flag.
+        check_request_cancelled(cancel_event)
         self.stop_flag: bool = False
+
+        def check_cancelled():
+            check_request_cancelled(cancel_event)
+            if strict_errors and self.stop_flag:
+                raise InferenceCancelled("TTS request cancelled")
+
+        check_cancelled()
         text: str = inputs.get("text", "")
         text_lang: str = inputs.get("text_lang", "")
         ref_audio_path: str = inputs.get("ref_audio_path", "")
@@ -1183,7 +1198,7 @@ class TTS:
                                     v2_token_chunks, v5_reference, stream_v5_windows,
                                     StreamingWindowSchedule)
             validate_streaming_options(inputs, self.configs.version)
-            stream_stop = PipelineStop(self)
+            stream_stop = PipelineStop(self, cancel_event, check_cancelled)
             stream_options = dict(inputs, sample_steps=sample_steps, cfg_rate=cfg_rate,
                 speed_factor=speed_factor,
                 streaming_chunk_seconds=inputs.get("streaming_chunk_seconds", 2.0),
@@ -1263,6 +1278,7 @@ class TTS:
             )
 
         ###### setting reference audio and prompt text preprocessing ########
+        check_cancelled()
         t0 = time.perf_counter()
         if (ref_audio_path is not None) and (
             ref_audio_path != self.prompt_cache["ref_audio_path"]
@@ -1271,6 +1287,7 @@ class TTS:
             if not os.path.exists(ref_audio_path):
                 raise ValueError(f"{ref_audio_path} not exists")
             self.set_ref_audio(ref_audio_path)
+            check_cancelled()
 
         aux_ref_audio_paths = aux_ref_audio_paths if aux_ref_audio_paths is not None else []
         paths = set(aux_ref_audio_paths) & set(self.prompt_cache["aux_ref_audio_paths"])
@@ -1278,12 +1295,14 @@ class TTS:
             self.prompt_cache["aux_ref_audio_paths"] = aux_ref_audio_paths
             self.prompt_cache["refer_spec"] = [self.prompt_cache["refer_spec"][0]]
             for path in aux_ref_audio_paths:
+                check_cancelled()
                 if path in [None, ""]:
                     continue
                 if not os.path.exists(path):
                     print(i18n("音频文件不存在，跳过："), path)
                     continue
                 self.prompt_cache["refer_spec"].append(self._get_ref_spec(path))
+                check_cancelled()
 
         if not no_prompt_text:
             prompt_text = prompt_text.strip("\n")
@@ -1291,9 +1310,11 @@ class TTS:
                 prompt_text += "。" if prompt_lang != "en" else "."
             print(i18n("实际输入的参考文本:"), prompt_text)
             if self.prompt_cache["prompt_text"] != prompt_text:
+                check_cancelled()
                 phones, bert_features, norm_text = self.text_preprocessor.segment_and_extract_feature_for_text(
                     prompt_text, prompt_lang, self.configs.version
                 )
+                check_cancelled()
                 self.prompt_cache["prompt_text"] = prompt_text
                 self.prompt_cache["prompt_lang"] = prompt_lang
                 self.prompt_cache["phones"] = phones
@@ -1301,11 +1322,15 @@ class TTS:
                 self.prompt_cache["norm_text"] = norm_text
 
         ###### text preprocessing ########
+        check_cancelled()
         t1 = time.perf_counter()
         data: list = None
         if not (return_fragment or streaming_mode):
             data = self.text_preprocessor.preprocess(text, text_lang, text_split_method, self.configs.version)
+            check_cancelled()
             if len(data) == 0:
+                if strict_errors:
+                    raise ValueError("Text preprocessing produced no content")
                 yield 16000, np.zeros(int(16000), dtype=np.int16)
                 return
 
@@ -1328,6 +1353,9 @@ class TTS:
                 text_lang,
                 text_split_method,
             )
+            check_cancelled()
+            if strict_errors and not texts:
+                raise ValueError("Text preprocessing produced no content")
             if gpt_streaming and text_split_method == "cut0" and len(texts) > 1:
                 raise ValueError("Text exceeds the single-session frontend limit; shorten the input")
             data = []
@@ -1340,9 +1368,11 @@ class TTS:
                 batch_data = []
                 print(f"############ {i18n('提取文本Bert特征')} ############")
                 for text in tqdm(batch_texts):
+                    check_cancelled()
                     phones, bert_features, norm_text = self.text_preprocessor.segment_and_extract_feature_for_text(
                         text, text_lang, self.configs.version
                     )
+                    check_cancelled()
                     if phones is None:
                         continue
                     res = {
@@ -1352,6 +1382,8 @@ class TTS:
                     }
                     batch_data.append(res)
                 if len(batch_data) == 0:
+                    if strict_errors:
+                        raise ValueError("Text preprocessing produced no phonemes")
                     return None
                 batch, _ = self.to_batch(
                     batch_data,
@@ -1376,6 +1408,7 @@ class TTS:
             is_first_package = True
             output_sr = self.configs.sampling_rate if not self.configs.use_vocoder else self.vocoder_configs["sr"]
             for item in data:
+                check_cancelled()
                 if gpt_streaming and stream_stop.is_set():
                     break
                 t3 = time.perf_counter()
@@ -1411,6 +1444,7 @@ class TTS:
                         sv_emb.append(self.sv_model.compute_embedding3(audio_tensor))
 
                 if not streaming_mode:
+                    check_cancelled()
                     print(f"############ {i18n('预测语义Token')} ############")
                     accel_batch_size = batch_size if parallel_infer else 1
                     if self.t2s_accel is not None and self.t2s_accel.max_batch_size != accel_batch_size:
@@ -1431,6 +1465,7 @@ class TTS:
                     if use_accel:
                         pred_semantic_list, idx_list = [], []
                         for start in range(0, len(all_phoneme_ids), accel_batch_size):
+                            check_cancelled()
                             end = start + accel_batch_size
                             tokens, token_lengths = self.t2s_accel.infer_batch(
                                 all_phoneme_ids[start:end],
@@ -1446,6 +1481,7 @@ class TTS:
                                 early_stop_num=self.configs.hz * self.configs.max_sec,
                                 repetition_penalty=repetition_penalty,
                             )
+                            check_cancelled()
                             pred_semantic_list.extend(tokens)
                             idx_list.extend(token_lengths)
                     else:
@@ -1461,6 +1497,7 @@ class TTS:
                             max_len=max_len,
                             repetition_penalty=repetition_penalty,
                         )
+                    check_cancelled()
                     t4 = time.perf_counter()
                     t_34 += t4 - t3
 
@@ -1508,6 +1545,7 @@ class TTS:
                         else:
                             # ## vits串行推理
                             for i, idx in enumerate(tqdm(idx_list)):
+                                check_cancelled()
                                 phones = batch_phones[i].unsqueeze(0).to(self.configs.device)
                                 _pred_semantic = (
                                     pred_semantic_list[i][-idx:].unsqueeze(0).unsqueeze(0)
@@ -1526,6 +1564,7 @@ class TTS:
                             batch_audio_fragment.extend(audio_fragments)
                         else:
                             for i, idx in enumerate(tqdm(idx_list)):
+                                check_cancelled()
                                 phones = batch_phones[i].unsqueeze(0).to(self.configs.device)
                                 _pred_semantic = (
                                     pred_semantic_list[i][-idx:].unsqueeze(0).unsqueeze(0)
@@ -1538,7 +1577,9 @@ class TTS:
 
                 elif gpt_streaming and self.configs.version in V5_VERSIONS:
                     if streaming_reference is None:
+                        check_cancelled()
                         streaming_reference = v5_reference(self)
+                        check_cancelled()
                     reference = streaming_reference
                     # Validate the acoustic context before starting the AR owner thread.
                     frames = round(stream_options["streaming_chunk_seconds"] * 100)
@@ -1551,12 +1592,15 @@ class TTS:
                         self.configs.device, streaming_tokens, batch_phones[0], reference,
                         stream_options, stream_stop)
                     for pcm in streaming_audio:
+                        check_cancelled()
                         yield output_sr, pcm
+                    check_cancelled()
                     streaming_audio.close()
                     streaming_tokens.close()
                     streaming_audio = streaming_tokens = None
-                    if not stream_stop.is_set() and fragment_interval:
-                        yield output_sr, np.zeros(int(output_sr * fragment_interval), dtype=np.int16)
+                    fragment_samples = int(output_sr * fragment_interval)
+                    if fragment_samples > 0 and not stream_stop.is_set():
+                        yield output_sr, np.zeros(fragment_samples, dtype=np.int16)
                     t4 = time.perf_counter()
                 else:
                     # refer_audio_spec: torch.Tensor = [
@@ -1571,7 +1615,7 @@ class TTS:
                             all_bert_features[0], stream_options, stream_stop)
                         semantic_token_generator = v2_token_chunks(streaming_tokens, min_chunk_length,
                             self.configs.mute_emb_sim_matrix if not fixed_length_chunk else None,
-                            chunk_split_thershold, schedule=window_schedule)
+                            chunk_split_thershold, schedule=window_schedule, stop=stream_stop)
                     else:
                         semantic_token_generator =self.t2s_model.model.infer_panel(
                             all_phoneme_ids[0].unsqueeze(0),
@@ -1612,8 +1656,9 @@ class TTS:
                     overlap_len = overlap_length
                     overlap_size = math.ceil(overlap_length*upsample_rate)
                     for semantic_tokens, is_final in semantic_token_generator:
+                        check_cancelled()
                         if semantic_tokens is None and last_audio_chunk is not None:
-                            yield self.audio_postprocess(
+                            audio_result = self.audio_postprocess(
                                     [[last_audio_chunk[-overlap_size:]]],
                                     output_sr,
                                     None,
@@ -1622,6 +1667,8 @@ class TTS:
                                     0.0,
                                     super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
                                 )
+                            check_cancelled()
+                            yield audio_result
                             break
 
                         _semantic_tokens = semantic_tokens
@@ -1656,6 +1703,7 @@ class TTS:
                                                     padding_length=token_padding_length,
                                                     **({"generator": acoustic_rng} if gpt_streaming else {})
                                                 )
+                            check_cancelled()
                             audio_chunk=audio_chunk.detach()[0, 0, :]
                         else:
                             raise RuntimeError(i18n("SoVits V3/4模型不支持流式推理模式"))
@@ -1689,6 +1737,7 @@ class TTS:
                             )
                         if window_schedule is not None:
                             window_schedule.observe(semantic_tokens.numel(), audio_result[1].size, output_sr)
+                        check_cancelled()
                         yield audio_result
                         
                         if is_first_package: 
@@ -1696,18 +1745,21 @@ class TTS:
                             is_first_package = False
 
 
+                    check_cancelled()
                     if gpt_streaming:
                         semantic_token_generator.close()
                         streaming_tokens.close()
                         semantic_token_generator = streaming_tokens = None
-                    if not gpt_streaming or not stream_stop.is_set():
-                        yield output_sr, np.zeros(int(output_sr*fragment_interval), dtype=np.int16)
+                    fragment_samples = int(output_sr * fragment_interval)
+                    if fragment_samples > 0 and (not gpt_streaming or not stream_stop.is_set()):
+                        yield output_sr, np.zeros(fragment_samples, dtype=np.int16)
 
                 t5 = time.perf_counter()
                 t_45 += t5 - t4
+                check_cancelled()
                 if return_fragment:
                     print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t4 - t3, t5 - t4))
-                    yield self.audio_postprocess(
+                    audio_result = self.audio_postprocess(
                         [batch_audio_fragment],
                         output_sr,
                         None,
@@ -1716,6 +1768,8 @@ class TTS:
                         fragment_interval,
                         super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
                     )
+                    check_cancelled()
+                    yield audio_result
                 elif streaming_mode:...
                 else:
                     audio.append(batch_audio_fragment)
@@ -1725,11 +1779,14 @@ class TTS:
                     return
 
             if not (return_fragment or streaming_mode):
+                check_cancelled()
                 print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t_34, t_45))
                 if len(audio) == 0:
+                    if strict_errors:
+                        raise ValueError("Synthesis produced no audio")
                     yield output_sr, np.zeros(int(output_sr), dtype=np.int16)
                     return
-                yield self.audio_postprocess(
+                audio_result = self.audio_postprocess(
                     audio,
                     output_sr,
                     batch_index_list,
@@ -1738,9 +1795,12 @@ class TTS:
                     fragment_interval,
                     super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
                 )
+                check_cancelled()
+                yield audio_result
+            check_cancelled()
 
         except Exception as e:
-            if gpt_streaming:
+            if gpt_streaming or strict_errors or isinstance(e, InferenceCancelled):
                 raise
             traceback.print_exc()
             # 必须返回一个空音频, 否则会导致显存不释放。

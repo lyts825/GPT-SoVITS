@@ -1,0 +1,16 @@
+{
+  "reference_audio": "ref_audios/host.wav",
+  "prompt_text": "请将本句替换为参考音频中实际说出的完整原文。",
+  "prompt_lang": "zh",
+  "text_lang": "zh",
+  "options": {
+    "streaming_mode": 1,
+    "gpt_streaming": false,
+    "batch_size": 1,
+    "text_split_method": "cut0",
+    "parallel_infer": false,
+    "split_bucket": false,
+    "fragment_interval": 0.0,
+    "speed_factor": 1.0
+  }
+}

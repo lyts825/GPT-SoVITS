@@ -1,0 +1,3 @@
+# Install after the upstream inference environment. No model dependencies here.
+fastapi[standard]>=0.115.2,<0.116
+pydantic>=2.8,<=2.10.6

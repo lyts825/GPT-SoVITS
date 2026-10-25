@@ -50,20 +50,34 @@ def validate_streaming_options(req, version, api_mode=False):
 
 
 class PipelineStop:
-    def __init__(self, pipeline):
+    def __init__(self, pipeline, request_event=None, check_cancelled=None):
         self.pipeline = pipeline
         self.cancelled = threading.Event()
+        self.request_event = request_event
+        self.check_cancelled = check_cancelled
 
     def is_set(self):
-        return self.cancelled.is_set() or self.pipeline.stop_flag
+        return (self.cancelled.is_set() or self.pipeline.stop_flag
+                or (self.request_event is not None and self.request_event.is_set()))
 
     def set(self):
         self.cancelled.set()
 
 
+def _stopped(stop):
+    # Legacy callers retain their graceful stop behavior. An opt-in request
+    # callback raises cancellation so its transport cannot report successful EOS.
+    check = getattr(stop, "check_cancelled", None)
+    if check is not None:
+        check()
+    return stop.is_set()
+
+
 def semantic_updates(pipeline, x, prompt, bert, req, stop):
     """Stream one text segment without cancelling the enclosing request."""
     # A separate decoder leaves the ordinary context and cache unchanged.
+    if _stopped(stop):
+        return
     acceleration = pipeline.streaming_accel
     if acceleration is None:
         acceleration = create_acceleration(
@@ -72,6 +86,8 @@ def semantic_updates(pipeline, x, prompt, bert, req, stop):
             use_cuda_graph=req.get("use_cuda_graph", True),
             use_flash_attention=req.get("use_flash_attention", True))
         pipeline.streaming_accel = acceleration
+    if _stopped(stop):
+        return
     if acceleration is None:
         raise ValueError("gpt_streaming requires a supported AR acceleration backend")
     stream_state = {"poll_partial": req.get("streaming_window_mode", "fixed") == "hybrid"}
@@ -85,7 +101,11 @@ def semantic_updates(pipeline, x, prompt, bert, req, stop):
         use_cuda_graph=req.get("use_cuda_graph", True),
         use_flash_attention=req.get("use_flash_attention", True), stop=stop, stream_state=stream_state)
     try:
-        yield from updates
+        for update in updates:
+            if _stopped(stop):
+                return
+            yield update
+        _stopped(stop)
     finally:
         # infer_stream closes/cancels this segment's handle. The TTS caller owns
         # the request-wide stop signal, which must survive normal segment EOS.
@@ -138,11 +158,13 @@ class StreamingWindowSchedule:
         self.started = now
 
 
-def v2_token_chunks(updates, chunk_length, mute_emb_sim_matrix=None, threshold=0.0, schedule=None):
+def v2_token_chunks(updates, chunk_length, mute_emb_sim_matrix=None, threshold=0.0, schedule=None, stop=None):
     """Convert cumulative AR prefixes to non-overlapping V2 decoder deltas."""
     cursor = previous_length = 0
     try:
         for tokens, finished in updates:
+            if stop is not None and _stopped(stop):
+                return
             tokens = tokens.reshape(-1)
             if tokens.numel() < previous_length:
                 raise RuntimeError("Semantic stream moved backwards")
@@ -152,6 +174,8 @@ def v2_token_chunks(updates, chunk_length, mute_emb_sim_matrix=None, threshold=0
                 yield (tail.unsqueeze(0) if tail.numel() else None), True
                 return
             while cursor < tokens.numel():
+                if stop is not None and _stopped(stop):
+                    return
                 available = tokens.numel() - cursor
                 length = schedule.choose(available if finished else schedule.maximum) if schedule is not None else chunk_length
                 if not finished and available < length + (2 if mute_emb_sim_matrix is not None else 0):
@@ -185,6 +209,8 @@ def v2_token_chunks(updates, chunk_length, mute_emb_sim_matrix=None, threshold=0
             if finished:
                 yield None, True
                 return
+        if stop is None or not _stopped(stop):
+            raise RuntimeError("Semantic stream ended without a final result")
     finally:
         updates.close()
 
@@ -213,6 +239,8 @@ def stream_v5_windows(vq_model, vocoder, denorm_spec, device, token_updates, pho
     The encoder has noncausal attention: finite lookahead trades full-utterance
     context for latency. Emitted samples are never regenerated or sent twice.
     """
+    if _stopped(stop):
+        return
     core = max(1, round(req["streaming_chunk_seconds"] * 100))
     hybrid = req.get("streaming_window_mode", "fixed") == "hybrid"
     future = round(req["streaming_lookahead_seconds"] * 100)
@@ -236,7 +264,7 @@ def stream_v5_windows(vq_model, vocoder, denorm_spec, device, token_updates, pho
     cursor = previous_tokens = 0
     schedule = StreamingWindowSchedule(core, min(1000-count, 640)) if hybrid else None
     for tokens, finished in token_updates:
-        if stop.is_set():
+        if _stopped(stop):
             return
         if tokens.numel() < previous_tokens:
             raise RuntimeError("Semantic stream moved backwards")
@@ -254,7 +282,7 @@ def stream_v5_windows(vq_model, vocoder, denorm_spec, device, token_updates, pho
         total = target.shape[-1]
         safe_end = total if finished else max(0, total - window_future - holdback)
         while cursor < total and (finished or cursor + core <= safe_end):
-            if stop.is_set():
+            if _stopped(stop):
                 return
             if schedule is not None:
                 core = schedule.choose(safe_end-cursor if finished else schedule.maximum)
@@ -276,9 +304,13 @@ def stream_v5_windows(vq_model, vocoder, denorm_spec, device, token_updates, pho
                 mu, lengths, prompt, req["sample_steps"],
                 inference_cfg_rate=req["cfg_rate"], generator=rng
             )[..., prompt.shape[-1]:].to(ref_mel.dtype)
+            if _stopped(stop):
+                return
             accepted = generated[..., :end-cursor]
             left = history[..., -left_frames:]
             audio = vocoder(denorm_spec(torch.cat((left, generated), -1)))[0, 0].float()
+            if _stopped(stop):
+                return
             offset = left.shape[-1] * 480
             current = audio[offset:offset+(end-cursor)*480]
             if current.numel() != (end-cursor)*480:
@@ -296,20 +328,27 @@ def stream_v5_windows(vq_model, vocoder, denorm_spec, device, token_updates, pho
             feature_history = torch.cat((feature_history, target[..., cursor:end]), -1)[..., -max(left_frames, 32):]
             units = end-cursor
             cursor = end
-            if stop.is_set():
+            if _stopped(stop):
                 return
             if not torch.isfinite(emitted).all():
                 raise RuntimeError("Non-finite V5 audio")
             pcm = (emitted.clamp(-1, 1) * 32767).to(torch.int16).cpu().numpy()
+            if _stopped(stop):
+                return
             if schedule is not None:
                 schedule.observe(units, pcm.size, 48000)
             yield pcm
         if finished:
+            if _stopped(stop):
+                return
             if cursor != total:
                 raise RuntimeError("Semantic streaming did not flush all acoustic frames")
             # EOS may arrive exactly at a previously emitted core boundary.
             if pending is not None:
-                yield (pending.clamp(-1, 1) * 32767).to(torch.int16).cpu().numpy()
+                pcm = (pending.clamp(-1, 1) * 32767).to(torch.int16).cpu().numpy()
+                if _stopped(stop):
+                    return
+                yield pcm
             return
-    if not stop.is_set():
+    if not _stopped(stop):
         raise RuntimeError("Semantic stream ended without a final result")
